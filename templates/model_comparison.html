@@ -82,6 +82,57 @@
     </div>
 
     <div class="section">
+        <h2>10-Fold Cross-Validation</h2>
+        <p class="form-note">
+            Every candidate model is additionally evaluated with
+            <strong>10-fold cross-validation</strong> (shuffled folds,
+            <code>random_state=42</code>) over the full dataset. The
+            preprocessor is refitted on each training fold only, so no
+            validation data leaks into the features. Values are
+            mean&nbsp;&plusmn;&nbsp;std across folds.
+        </p>
+        {% if cv %}
+        <div class="table-container">
+            <table class="data-table">
+                <tr>
+                    <th>Model</th>
+                    <th>Folds</th>
+                    <th>CV MAE</th>
+                    <th>CV RMSE</th>
+                    <th>CV R&sup2;</th>
+                </tr>
+                {% for row in cv %}
+                <tr>
+                    <td>{{ row.model }}</td>
+                    <td>{{ row.cv_folds if row.cv_folds is not none else "-" }}</td>
+                    {% if row.cv_error %}
+                    <td colspan="3">cross-validation failed: {{ row.cv_error }}</td>
+                    {% else %}
+                    <td>{{ row.cv_mae_mean }} &plusmn; {{ row.cv_mae_std }}</td>
+                    <td>{{ row.cv_rmse_mean }} &plusmn; {{ row.cv_rmse_std }}</td>
+                    <td>{{ row.cv_r2_mean }} &plusmn; {{ row.cv_r2_std }}</td>
+                    {% endif %}
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <p>No cross-validation results are available for this run.</p>
+        </div>
+        {% endif %}
+
+        {% if plots.cv %}
+        <h3>CV R&sup2; Chart</h3>
+        <img
+            src="{{ url_for('static', filename='plots/' + plots.cv) }}"
+            alt="10-Fold Cross-Validation R2 Chart"
+            class="plot-image"
+        >
+        {% endif %}
+    </div>
+
+    <div class="section">
         <h2>Test R&sup2; Chart</h2>
         <img
             src="{{ url_for('static', filename='plots/' + plots.comparison) }}"

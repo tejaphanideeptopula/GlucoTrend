@@ -21,9 +21,11 @@ import pandas as pd
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from sklearn.base import clone
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.svm import SVR
@@ -64,6 +66,8 @@ TARGET = "glucose"
 TEST_SIZE = 0.20
 RANDOM_STATE = 42
 SVR_MAX_TRAIN_ROWS = 3000
+CV_FOLDS = 10
+CV_MIN_GOOD_FOLDS = 5
 
 # Module-level cache so page loads do not retrain on every request.
 _CACHE = {"key": None, "result": None}
@@ -126,6 +130,80 @@ def _regression_metrics(y_true, y_pred):
     }
 
 
+def _cv_summary(folds):
+    """Aggregate per-fold metrics into mean/std values for display."""
+    def _stats(key):
+        values = [f[key] for f in folds if f.get(key) is not None]
+        if not values:
+            return None, None
+        arr = np.asarray(values, dtype=float)
+        return (round(float(arr.mean()), 4),
+                round(float(arr.std(ddof=1)) if len(arr) > 1 else 0.0, 4))
+
+    mae_mean, mae_std = _stats("MAE")
+    rmse_mean, rmse_std = _stats("RMSE")
+    r2_mean, r2_std = _stats("R2")
+    return {
+        "cv_mae_mean": mae_mean,
+        "cv_mae_std": mae_std,
+        "cv_rmse_mean": rmse_mean,
+        "cv_rmse_std": rmse_std,
+        "cv_r2_mean": r2_mean,
+        "cv_r2_std": r2_std,
+        "cv_folds": len(folds),
+    }
+
+
+def cross_validate_estimator(estimator, needs_subsample, preprocessor, X, y):
+    """Evaluate one candidate regressor with 10-fold cross-validation.
+
+    The preprocessor is cloned and fitted on each training fold only, so
+    no validation-fold information leaks into the features.  Folds that
+    fail are skipped; fewer than CV_MIN_GOOD_FOLDS successes counts as a
+    failed cross-validation for this model.
+    """
+    kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    folds = []
+    errors = []
+    for fold_index, (train_idx, val_idx) in enumerate(kf.split(X), start=1):
+        X_train_fold = X.iloc[train_idx]
+        X_val_fold = X.iloc[val_idx]
+        y_train_fold = y.iloc[train_idx]
+        y_val_fold = y.iloc[val_idx]
+
+        fold_prep = clone(preprocessor)
+        try:
+            X_train_t = fold_prep.fit_transform(X_train_fold)
+            X_val_t = fold_prep.transform(X_val_fold)
+            fold_est = clone(estimator)
+            if needs_subsample and len(X_train_t) > SVR_MAX_TRAIN_ROWS:
+                rng = np.random.RandomState(RANDOM_STATE)
+                take = rng.choice(len(X_train_t), size=SVR_MAX_TRAIN_ROWS,
+                                  replace=False)
+                take.sort()
+                fit_X, fit_y = X_train_t[take], y_train_fold.iloc[take]
+            else:
+                fit_X, fit_y = X_train_t, y_train_fold
+            fold_est.fit(fit_X, fit_y)
+            preds = fold_est.predict(X_val_t)
+        except Exception as exc:  # noqa: BLE001 - one broken fold must not stop the rest
+            errors.append("fold {}: {}".format(fold_index, exc))
+            continue
+
+        metrics = _regression_metrics(y_val_fold, preds)
+        folds.append({"fold": fold_index, **metrics})
+
+    if len(folds) < CV_MIN_GOOD_FOLDS:
+        return {
+            "error": "only {}/{} folds succeeded ({})".format(
+                len(folds), CV_FOLDS,
+                "; ".join(errors) if errors else "insufficient folds",
+            ),
+            "folds": folds,
+        }
+    return {"error": None, "folds": folds, **_cv_summary(folds)}
+
+
 def _candidate_estimators():
     """(name, estimator, needs_subsample) triples for the regression suite."""
     candidates = [
@@ -153,6 +231,33 @@ def _candidate_estimators():
             False,
         ))
     return candidates
+
+
+def _generate_cv_plot(rows):
+    """Bar chart of 10-fold CV R2 (mean +/- std) for every candidate."""
+    cv_rows = [r for r in rows if r.get("cv_r2_mean") is not None]
+    if not cv_rows:
+        return None
+
+    names = [r["model"] for r in cv_rows]
+    means = [r["cv_r2_mean"] for r in cv_rows]
+    stds = [r.get("cv_r2_std") or 0.0 for r in cv_rows]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bars = ax.bar(names, means, yerr=stds, capsize=5,
+                  color="#52b788", edgecolor="#2d6a4f", ecolor="#1b4332")
+    ax.set_ylabel("R² (10-fold CV mean)")
+    ax.set_title("10-Fold Cross-Validation - R² (mean ± std)")
+    ax.set_ylim(0, max(1.0, max(m + s for m, s in zip(means, stds)) * 1.05))
+    for bar, mean, std in zip(bars, means, stds):
+        ax.text(bar.get_x() + bar.get_width() / 2, mean + std + 0.005,
+                "{:.4f}".format(mean), ha="center", fontsize=9)
+    plt.xticks(rotation=20, ha="right")
+    plt.tight_layout()
+    cv_plot = "cross_validation_r2.png"
+    plt.savefig(os.path.join(PLOT_DIR, cv_plot), dpi=140)
+    plt.close()
+    return cv_plot
 
 
 def _generate_comparison_plots(rows, best_name, y_test, best_preds):
@@ -282,6 +387,24 @@ def train_all(use_cache=True):
         })
         fitted[name] = estimator
 
+    # 10-fold cross-validation over the full dataset, reported alongside
+    # the holdout metrics (best-model selection still uses test R2).
+    for name, estimator, needs_subsample in _candidate_estimators():
+        row = next((r for r in rows if r["model"] == name), None)
+        if row is None or row.get("R2") is None:
+            continue
+        cv = cross_validate_estimator(
+            estimator, needs_subsample, preprocessor, X, y
+        )
+        if cv.get("error"):
+            row["cv_error"] = cv["error"]
+            row["cv_folds"] = len(cv.get("folds", []))
+        else:
+            row.update({
+                k: v for k, v in cv.items()
+                if k not in ("error", "folds")
+            })
+
     scored = [r for r in rows if r["R2"] is not None]
     if not scored:
         return {"error": "Every candidate model failed to train."}
@@ -292,6 +415,9 @@ def train_all(use_cache=True):
     plots = _generate_comparison_plots(
         scored, best_name, y_test.to_numpy(), best_preds
     )
+    cv_plot = _generate_cv_plot(scored)
+    if cv_plot:
+        plots["cv"] = cv_plot
 
     result = {
         "error": None,
@@ -300,6 +426,16 @@ def train_all(use_cache=True):
         "comparison": sorted(rows, key=lambda r: (r["R2"] is None, -(r["R2"] or 0))),
         "best_model": best_name,
         "best_metrics": best_row,
+        "cv_folds": CV_FOLDS,
+        "cv": [
+            {k: r.get(k) for k in (
+                "model", "cv_mae_mean", "cv_mae_std",
+                "cv_rmse_mean", "cv_rmse_std",
+                "cv_r2_mean", "cv_r2_std", "cv_folds", "cv_error",
+            )}
+            for r in sorted(rows, key=lambda r: (r.get("cv_r2_mean") is None,
+                                                 -(r.get("cv_r2_mean") or 0)))
+        ],
         "train_rows": int(len(X_train)),
         "test_rows": int(len(X_test)),
         "feature_names": list(X.columns),
@@ -364,6 +500,8 @@ def train_and_save():
         "field_stats": field_stats,
         "comparison": result["comparison"],
         "metrics": result["best_metrics"],
+        "cv_folds": result["cv_folds"],
+        "cv": result["cv"],
         "train_rows": result["train_rows"],
         "test_rows": result["test_rows"],
         "trained_at": result["trained_at"],
@@ -387,6 +525,8 @@ def train_and_save():
         "best_model": artifact["best_model_name"],
         "metrics": artifact["metrics"],
         "comparison": artifact["comparison"],
+        "cv_folds": artifact["cv_folds"],
+        "cv": artifact["cv"],
         "model_path": MODEL_PATH,
         "model_size_kb": round(os.path.getsize(MODEL_PATH) / 1024, 1),
         "trained_at": artifact["trained_at"],

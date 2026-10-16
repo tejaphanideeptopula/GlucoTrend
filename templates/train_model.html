@@ -136,6 +136,43 @@
             </table>
         </div>
 
+        {% if result.cv %}
+        <h3>10-Fold Cross-Validation (mean &plusmn; std)</h3>
+        <div class="table-container">
+            <table class="data-table">
+                <tr>
+                    <th>Model</th>
+                    <th>Folds</th>
+                    <th>CV MAE</th>
+                    <th>CV RMSE</th>
+                    <th>CV R&sup2;</th>
+                </tr>
+                {% for row in result.cv %}
+                <tr>
+                    <td>{{ row.model }}</td>
+                    <td>{{ row.cv_folds if row.cv_folds is not none else "-" }}</td>
+                    {% if row.cv_error %}
+                    <td colspan="3">cross-validation failed: {{ row.cv_error }}</td>
+                    {% else %}
+                    <td>{{ row.cv_mae_mean }} &plusmn; {{ row.cv_mae_std }}</td>
+                    <td>{{ row.cv_rmse_mean }} &plusmn; {{ row.cv_rmse_std }}</td>
+                    <td>{{ row.cv_r2_mean }} &plusmn; {{ row.cv_r2_std }}</td>
+                    {% endif %}
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+        {% endif %}
+
+        {% if result.plots and result.plots.cv %}
+        <h3>CV R&sup2; Chart</h3>
+        <img
+            src="{{ url_for('static', filename='plots/' + result.plots.cv) }}"
+            alt="10-Fold Cross-Validation R2 Chart"
+            class="plot-image"
+        >
+        {% endif %}
+
         <div class="success">
             Model saved at <code>{{ result.model_path }}</code>.
             The <a href="/predict">Predict</a> page now uses this artifact.
@@ -151,6 +188,7 @@
             <li>Builds leakage-safe features (identifiers, notes and the leaky rolling mean are removed; timestamps become time features).</li>
             <li>Uses a chronological 80/20 train-test split.</li>
             <li>Fits the preprocessing pipeline on training data only.</li>
+            <li>Validates every model with <strong>10-fold cross-validation</strong> (shuffled folds, <code>random_state=42</code>), refitting the preprocessor on each training fold to prevent leakage.</li>
             <li>Trains Linear, Ridge, Decision Tree, Random Forest, KNN, SVR, Gradient Boosting and (when installed) XGBoost regressors.</li>
             <li>Selects the best model by test R&sup2; and saves pipeline + metadata with joblib (atomic write).</li>
         </ul>
